@@ -1,0 +1,831 @@
+/*---------------------------------------------------------------------------
+ * Gamedriver - Dump object statistics.
+ *
+ *---------------------------------------------------------------------------
+ * Function to compute the memory usage of objects and dump their
+ * statistics.
+ *---------------------------------------------------------------------------
+ */
+
+#include "driver.h"
+#include "typedefs.h"
+
+#include <stdio.h>
+#ifdef HAVE_SYS_TIME_H
+#include <sys/time.h>
+#endif
+#include <time.h>
+
+#include "dumpstat.h"
+#include "array.h"
+#include "closure.h"
+#include "coroutine.h"
+#include "exec.h"
+#include "filestat.h"
+#include "instrs.h"  /* F_RETURN, F_RETURN0 for overhead computation */
+#include "interpret.h"
+#include "lwobject.h"
+#include "mapping.h"
+#include "mstrings.h"
+#include "object.h"
+#include "ptrtable.h"
+#include "simulate.h"
+#include "stdstrings.h"
+#include "structs.h"
+#include "svalue.h"
+#include "xalloc.h"
+
+/*-------------------------------------------------------------------------*/
+
+static size_t svalue_size(svalue_t *, mp_int *); /* forward */
+
+/* Auxiliary structure for counting a mapping */
+
+struct svalue_size_locals
+{
+    mp_uint composite;   /* Return: total composite memory usage of all elmts */
+    mp_uint total;       /* Return: total memory usage of all elmts */
+    int     num_values;  /* Passed: width of the mapping */
+};
+
+/*-------------------------------------------------------------------------*/
+
+static struct pointer_table *ptable;
+  /* The pointer_table to register all arrays and mappings.
+   */
+
+/*-------------------------------------------------------------------------*/
+static void
+svalue_size_map_filter (svalue_t *key, svalue_t *values, void *extra)
+
+/* Called for all keys in a mapping, it counts the size of the values
+ * and returns the total in extra->num_values.
+ */
+
+{
+    struct svalue_size_locals *locals;
+    mp_int total;
+    int i;
+
+    locals = (struct svalue_size_locals*)extra;
+    locals->composite += svalue_size(key, &total);
+    locals->total += total;
+    for(i = locals->num_values; --i >= 0; )
+    {
+        locals->composite += svalue_size(values++, &total) + sizeof(svalue_t);
+        locals->total += total + sizeof(svalue_t);
+    }
+}
+
+/*-------------------------------------------------------------------------*/
+static size_t
+svalue_size (svalue_t *v, mp_int * pTotal)
+
+/* Compute the memory usage of *<v> (modified to reflect data sharing),
+ * calling svalue_size() recursively if necessary, and return it.
+ * The size of *v itself is not included.
+ * *<pUnshared> and *<pShared> are set to the total unshared and shared
+ * datasize.
+ */
+
+{
+    mp_int i, composite, total, overhead;
+
+    assert_stack_gap();
+
+    *pTotal = 0;
+
+    total = overhead = composite = 0;
+
+    switch(v->type)
+    {
+    case T_OBJECT:
+    case T_NUMBER:
+    case T_FLOAT:
+    case T_LPCTYPE:
+        return 0;
+
+    case T_STRING:
+    case T_BYTES:
+    case T_SYMBOL:
+        // If ref==0 the string is probably shared a lot, but we can't estimate
+        // the correct number, so we return 0 as memory consumption for the
+        // string.
+        if (v->u.str->info.ref)
+        {
+            *pTotal = mstr_mem_size(v->u.str);
+            return *pTotal / v->u.str->info.ref;
+        }
+        else
+            return 0;
+
+    case T_MAPPING:
+    {
+        if (v->u.map->ref)
+        {
+            struct pointer_record* record = find_add_pointer(ptable, v->u.map, MY_TRUE);
+            if (record->ref_count < 0)
+            {
+                /* New entry, determine the size. */
+                struct svalue_size_locals locals;
+
+                record->ref_count = 1;
+                record->id_number = 0;
+
+                overhead = (mp_uint)mapping_overhead(v->u.map);
+
+                locals.total = 0;
+                locals.composite = 0;
+                locals.num_values = v->u.map->num_values;
+                walk_mapping(v->u.map, svalue_size_map_filter, &locals);
+
+                *pTotal = locals.total + overhead;
+
+                /* Record it for later occurrences. */
+                record->id_number = overhead + locals.composite;
+                return record->id_number * record->ref_count / v->u.map->ref;
+            }
+            else
+            {
+                /* We have seen it. Don't need to add to the total,
+                 * but the the shared result.
+                 */
+                record->ref_count++;
+                return record->id_number / v->u.vec->ref;
+            }
+        }
+        else
+            return 0;
+    }
+
+    case T_POINTER:
+    case T_QUOTED_ARRAY:
+    {
+        if (v->u.vec == &null_vector) return 0;
+
+        if (v->u.vec->ref)
+        {
+            struct pointer_record* record = find_add_pointer(ptable, v->u.vec, MY_TRUE);
+            if (record->ref_count < 0)
+            {
+                /* New entry, determine the size. */
+                record->ref_count = 1;
+                record->id_number = 0;
+
+                overhead = sizeof *v->u.vec
+                         + sizeof(svalue_t) * v->u.vec->size + sizeof(char *);
+                for (i=0; i < (mp_int)VEC_SIZE(v->u.vec); i++)
+                {
+                    composite += svalue_size(&v->u.vec->item[i], &total);
+                    *pTotal += total;
+                }
+
+                *pTotal += overhead;
+
+                /* Record it for later occurrences. */
+                record->id_number = overhead + composite;
+                return record->id_number * record->ref_count / v->u.vec->ref;
+            }
+            else
+            {
+                /* We have seen it. Don't need to add to the total,
+                 * but the the shared result.
+                 */
+                record->ref_count++;
+                return record->id_number / v->u.vec->ref;
+            }
+        }
+        else
+            return 0;
+    }
+    case T_STRUCT:
+    {
+        struct_t *st = v->u.strct;
+
+        if (st->ref)
+        {
+            struct pointer_record* record = find_add_pointer(ptable, st, MY_TRUE);
+            if (record->ref_count < 0)
+            {
+                /* New entry, determine the size. */
+                record->ref_count = 1;
+                record->id_number = 0;
+
+                overhead = sizeof *st - sizeof st->member
+                         + sizeof(svalue_t) * struct_size(st);
+                for (i=0; i < (mp_int)struct_size(st); i++)
+                {
+                    composite += svalue_size(&st->member[i], &total);
+                    *pTotal += total;
+                }
+
+                *pTotal += overhead;
+
+                /* Record it for later occurrences. */
+                record->id_number = overhead + composite;
+                return record->id_number * record->ref_count / st->ref;
+            }
+            else
+            {
+                /* We have seen it. Don't need to add to the total,
+                 * but the the shared result.
+                 */
+                record->ref_count++;
+                return record->id_number / st->ref;
+            }
+        }
+        else
+            return 0;
+    }
+
+    case T_LWOBJECT:
+    {
+        lwobject_t *lwob = v->u.lwob;
+
+        if (lwob->ref)
+        {
+            struct pointer_record* record = find_add_pointer(ptable, lwob, MY_TRUE);
+            if (record->ref_count < 0)
+            {
+                /* New entry, determine the size. */
+                record->ref_count = 1;
+                record->id_number = 0;
+
+                overhead = sizeof *lwob
+                         + sizeof(svalue_t) * lwob->prog->num_variables;
+                for (i=0; i < lwob->prog->num_variables; i++)
+                {
+                    composite += svalue_size(&lwob->variables[i], &total);
+                    *pTotal += total;
+                }
+
+                *pTotal += overhead;
+
+                /* Record it for later occurrences. */
+                record->id_number = overhead + composite;
+                return record->id_number * record->ref_count / lwob->ref;
+            }
+            else
+            {
+                /* We have seen it. Don't need to add to the total,
+                 * but the the shared result.
+                 */
+                record->ref_count++;
+                return record->id_number / lwob->ref;
+            }
+        }
+        else
+            return 0;
+    }
+
+    case T_CLOSURE:
+    {
+        int num_values;
+        svalue_t *svp;
+        lambda_t *l;
+
+        if (!CLOSURE_MALLOCED(v->x.closure_type)) return 0;
+        if (!CLOSURE_REFERENCES_CODE(v->x.closure_type))
+        {
+            if (v->x.closure_type == CLOSURE_LFUN)
+                composite = SIZEOF_LFUN_CLOSURE(v->u.lfun_closure->context_size);
+            else /* CLOSURE_IDENTIFIER */
+                composite = sizeof *v->u.identifier_closure;
+
+            composite += sizeof(char *);
+            *pTotal = composite;
+            return composite / v->u.closure->ref;
+        }
+        /* CLOSURE_LAMBDA */
+        composite = overhead = 0;
+        if (v->x.closure_type == CLOSURE_BOUND_LAMBDA)
+        {
+            bound_lambda_t *bl = v->u.bound_lambda;
+
+            total = sizeof *bl;
+            *pTotal += total;
+            composite += total / bl->base.ref;
+            l = bl->lambda;
+        }
+        else
+            l = v->u.lambda;
+        num_values = l->num_values;
+        svp = (svalue_t *)l - num_values;
+        if (NULL == register_pointer(ptable, svp)) return 0;
+        overhead = sizeof(svalue_t) * num_values + sizeof (char *);
+        {
+            bytecode_p p = l->program;
+            do {
+                switch(GET_CODE(p++)) {
+                  case F_RETURN:
+                  case F_RETURN0:
+                    break;
+                  default:
+                    continue;
+                }
+                break;
+            } while (1);
+            overhead +=   (p - (bytecode_p)l + (sizeof(bytecode_p) - 1))
+                        & ~(sizeof(bytecode_p) - 1);
+        }
+
+        while (--num_values >= 0)
+        {
+            composite += svalue_size(svp++, &total);
+            *pTotal += total;
+        }
+
+        *pTotal += overhead;
+        if (l->base.ref)
+            return (overhead + composite) / l->base.ref;
+        else
+            return 0;
+    }
+
+    case T_COROUTINE:
+    {
+        coroutine_t *cr = v->u.coroutine;
+
+        if (cr->ref)
+        {
+            struct pointer_record* record = find_add_pointer(ptable, cr, MY_TRUE);
+            if (record->ref_count < 0)
+            {
+                /* New entry, determine the size. */
+                record->ref_count = 1;
+                record->id_number = 0;
+
+                overhead = sizeof *cr
+                         + sizeof(svalue_t) * cr->num_variables;
+                for (i=0; i < cr->num_variables; i++)
+                {
+                    composite += svalue_size(cr->variables+i, &total);
+                    *pTotal += total;
+                }
+
+                *pTotal += overhead;
+
+                /* Record it for later occurrences. */
+                record->id_number = overhead + composite;
+                return record->id_number * record->ref_count / cr->ref;
+            }
+            else
+            {
+                /* We have seen it. Don't need to add to the total,
+                 * but the the shared result.
+                 */
+                record->ref_count++;
+                return record->id_number / cr->ref;
+            }
+        }
+        else
+            return 0;
+    }
+
+    case T_LVALUE:
+        switch(v->x.lvalue_type)
+        {
+            default:
+                fatal("Illegal lvalue %p type %d\n", v, v->x.lvalue_type);
+                /* NOTREACHED */
+                break;
+
+            case LVALUE_PROTECTED:
+            {
+                struct protected_lvalue *lv = v->u.protected_lvalue;
+
+                if (lv->ref)
+                {
+                    struct pointer_record* record = find_add_pointer(ptable, lv, MY_TRUE);
+                    if (record->ref_count < 0)
+                    {
+                        /* New entry, determine the size. */
+                        record->ref_count = 1;
+                        record->id_number = 0;
+
+                        overhead = sizeof *lv;
+                        composite = svalue_size(&lv->val, pTotal);
+                        *pTotal += overhead;
+
+                        /* Record it for later occurrences. */
+                        record->id_number = overhead + composite;
+                        return record->id_number * record->ref_count / lv->ref;
+                    }
+                    else
+                    {
+                        /* We have seen it. Don't need to add to the total,
+                         * but the the shared result.
+                         */
+                        record->ref_count++;
+                        return record->id_number / lv->ref;
+                    }
+                }
+                else
+                    return 0;
+            }
+
+            case LVALUE_PROTECTED_CHAR:
+            {
+                struct protected_char_lvalue *lv = v->u.protected_char_lvalue;
+
+                if (lv->ref)
+                {
+                    struct pointer_record* record = find_add_pointer(ptable, lv, MY_TRUE);
+                    if (record->ref_count < 0)
+                    {
+                        /* New entry, determine the size. */
+                        record->ref_count = 1;
+                        record->id_number = 0;
+
+                        overhead = sizeof *lv;
+
+                        if (lv->str->info.ref)
+                        {
+                            *pTotal = mstr_mem_size(lv->str);
+                            composite = *pTotal / lv->str->info.ref;
+                        }
+                        *pTotal += overhead;
+
+                        /* Record it for later occurrences. */
+                        record->id_number = overhead + composite;
+                        return record->id_number * record->ref_count / lv->ref;
+                    }
+                    else
+                    {
+                        /* We have seen it. Don't need to add to the total,
+                         * but the the shared result.
+                         */
+                        record->ref_count++;
+                        return record->id_number / lv->ref;
+                    }
+                }
+                else
+                    return 0;
+            }
+
+            case LVALUE_PROTECTED_RANGE:
+            {
+                struct protected_range_lvalue *lv = v->u.protected_range_lvalue;
+
+                if (lv->ref)
+                {
+                    struct pointer_record* record = find_add_pointer(ptable, lv, MY_TRUE);
+                    if (record->ref_count < 0)
+                    {
+                        /* New entry, determine the size. */
+                        record->ref_count = 1;
+                        record->id_number = 0;
+
+                        overhead = sizeof *lv;
+                        composite = svalue_size(&lv->vec, &total);
+                        *pTotal = total + overhead;
+
+                        if (lv->var != NULL)
+                        {
+                            svalue_t dummy = { T_LVALUE };
+                            dummy.x.lvalue_type = LVALUE_PROTECTED;
+                            dummy.u.protected_lvalue = lv->var;
+
+                            composite += svalue_size(&dummy, &total);
+                            *pTotal += total;
+                        }
+
+                        /* Record it for later occurrences. */
+                        record->id_number = overhead + composite;
+                        return record->id_number * record->ref_count / lv->ref;
+                    }
+                    else
+                    {
+                        /* We have seen it. Don't need to add to the total,
+                         * but the the shared result.
+                         */
+                        record->ref_count++;
+                        return record->id_number / lv->ref;
+                    }
+                }
+                else
+                    return 0;
+            }
+
+            case LVALUE_PROTECTED_MAPENTRY:
+            {
+                struct protected_mapentry_lvalue *lv = v->u.protected_mapentry_lvalue;
+
+                if (lv->ref)
+                {
+                    struct pointer_record* record = find_add_pointer(ptable, lv, MY_TRUE);
+                    if (record->ref_count < 0)
+                    {
+                        /* New entry, determine the size. */
+                        svalue_t m = { T_MAPPING };
+                        mp_int total2;
+
+                        record->ref_count = 1;
+                        record->id_number = 0;
+
+                        m.u.map = lv->map;
+
+                        overhead = sizeof *lv;
+                        composite = svalue_size(&(lv->key), &total);
+                        composite += svalue_size(&m, &total2);
+
+                        *pTotal = total + total2 + overhead;
+
+                        /* Record it for later occurrences. */
+                        record->id_number = overhead + composite;
+                        return record->id_number * record->ref_count / lv->ref;
+                    }
+                    else
+                    {
+                        /* We have seen it. Don't need to add to the total,
+                         * but the the shared result.
+                         */
+                        record->ref_count++;
+                        return record->id_number / lv->ref;
+                    }
+                }
+                else
+                    return 0;
+            }
+
+            case LVALUE_PROTECTED_MAP_RANGE:
+            {
+                struct protected_map_range_lvalue *lv = v->u.protected_map_range_lvalue;
+
+                if (lv->ref)
+                {
+                    struct pointer_record* record = find_add_pointer(ptable, lv, MY_TRUE);
+                    if (record->ref_count < 0)
+                    {
+                        /* New entry, determine the size. */
+                        svalue_t m = { T_MAPPING };
+                        mp_int total2;
+
+                        record->ref_count = 1;
+                        record->id_number = 0;
+
+                        m.u.map = lv->map;
+
+                        overhead = sizeof *lv;
+                        composite = svalue_size(&(lv->key), &total);
+                        composite += svalue_size(&m, &total2);
+
+                        *pTotal = total + total2 + overhead;
+
+                        /* Record it for later occurrences. */
+                        record->id_number = overhead + composite;
+                        return record->id_number * record->ref_count / lv->ref;
+                    }
+                    else
+                    {
+                        /* We have seen it. Don't need to add to the total,
+                         * but the the shared result.
+                         */
+                        record->ref_count++;
+                        return record->id_number / lv->ref;
+                    }
+                }
+                else
+                    return 0;
+            }
+
+        } /* switch */
+
+#ifdef USE_PYTHON
+    case T_PYTHON:
+        /* Difficult to determine the memory consumption of a Python object,
+         * so we don't do that here.
+         */
+        return 0;
+#endif
+
+    default:
+        fatal("Illegal type: %d\n", v->type);
+    }
+
+    /*NOTREACHED*/
+    return 0;
+}
+
+/*-------------------------------------------------------------------------*/
+mp_int
+data_size_vec (svalue_t *vec, int size, mp_int * pTotal)
+
+/* Compute the memory usage of the data held by the vector <vec> of
+ * size <size> and return it. Shared data will only count according
+ * to its share.
+ *
+ * If <pTotal> is given, *<pTotal> is set to the raw datasize.
+ */
+
+{
+    mp_int total = 0;
+
+    if (pTotal != NULL)
+        *pTotal = 0;
+
+    if (!size)
+        return 0;
+
+    ptable = new_pointer_table();
+    if (!ptable)
+        errorf("(dumpstat) Out of memory for new pointer table.\n");
+
+    for (; size-- > 0; vec++)
+    {
+        mp_int tmp;
+        total += svalue_size(vec, &tmp) + sizeof (svalue_t);
+        if (pTotal != NULL)
+            *pTotal += tmp + sizeof(svalue_t);
+    }
+
+    free_pointer_table(ptable);
+    return total;
+} /* data_size_vec() */
+
+/*-------------------------------------------------------------------------*/
+mp_int
+data_size (object_t *ob, mp_int * pTotal)
+
+/* Compute the memory usage (modified to reflect shared data use)
+ * of the data held by object <ob> and return it.
+ * If the object is swapped out or has no variables, return 0.
+ *
+ * If <pTotal> is given, *<pTotal> is set to the raw datasize.
+ */
+
+{
+    if ((ob->flags & O_SWAPPED) || !ob->prog->num_variables)
+    {
+        if (pTotal != NULL)
+            *pTotal = 0;
+
+        return 0;
+    }
+
+    return data_size_vec(ob->variables, ob->prog->num_variables, pTotal);
+} /* data_size() */
+
+/*-------------------------------------------------------------------------*/
+mp_int
+program_string_size (program_t *prog, mp_int * pOverhead, mp_int * pData)
+
+/* Compute the composite data size of all strings in program <prog>
+ * which must be swapped in.
+ * Set *<pOverhead> to the size of the overhead in the program structure,
+ * and *<pData> to the raw data size of the strings.
+ */
+
+{
+    int i;
+    mp_int rc, data;
+
+    rc = data = 0;
+
+    for (i = prog->num_strings; i--; )
+    {
+        string_t * str = prog->strings[i];
+        mp_int size;
+
+        size = mstr_mem_size(str);
+        data += size;
+        rc += size / str->info.ref;
+    }
+
+    *pOverhead = prog->num_strings * sizeof(char *);
+    *pData = data;
+    return rc;
+} /* program_string_size() */
+
+/*-------------------------------------------------------------------------*/
+Bool
+dumpstat (string_t *fname)
+
+/* This function dumps statistics about all listed objects into the file
+ * $MUDLIB/<fname>. It is called from dump_driver_info.
+ * Return TRUE on success, FALSE if <fname> can't be written.
+ */
+
+{
+    FILE *f;
+    object_t *ob;
+    char *native;
+
+    static char *swapstrings[] =
+        {"", "PROG SWAPPED", "VAR SWAPPED", "SWAPPED", };
+
+    fname = check_valid_path(fname, current_object, STR_OBJDUMP, MY_TRUE);
+    if (!fname)
+        return MY_FALSE;
+
+    native = convert_path_str_to_native_or_throw(fname);
+    f = fopen(native, "w");
+    if (!f)
+        return MY_FALSE;
+    FCOUNT_WRITE(native);
+
+    for (ob = obj_list; ob; ob = ob->next_all)
+    {
+        mp_int compsize, totalsize, overhead;
+        char timest[21];
+        struct tm *tm;
+
+#ifdef DEBUG
+        if (ob->flags & O_DESTRUCTED) /* TODO: Can't happen */
+            continue;
+#endif
+        compsize = data_size(ob, &totalsize);
+
+        if (!O_PROG_SWAPPED(ob)
+         && (ob->prog->ref == 1 || !(ob->flags & (O_CLONE|O_REPLACED))))
+        {
+             overhead = ob->prog->total_size;
+        }
+        else
+        {
+            overhead = 0;
+        }
+
+        overhead += sizeof (object_t);
+
+        fprintf(f, "%-20s %5"PRIdMPINT" (%5"PRIdMPINT") ref %2"PRIdPINT" %s "
+                 , get_txt(ob->name)
+                 , compsize + overhead, totalsize + overhead
+                 , ob->ref
+                 , ob->flags & O_HEART_BEAT ? "HB" : "  "
+        );
+        if (ob->super)
+            fprintf(f, "%s ", get_txt(ob->super->name));
+        else
+            fprintf(f, "-- ");
+
+        if (ob->gigaticks)
+            fprintf(f, " (%"PRIuMPINT"%09"PRIuMPINT")", 
+                    (mp_uint)ob->gigaticks, (mp_uint)ob->ticks);
+        else
+            fprintf(f, " (%"PRIuMPINT")", (mp_uint)ob->ticks);
+        fprintf(f, " %s",
+                swapstrings[(O_PROG_SWAPPED(ob)?1:0) | (O_VAR_SWAPPED(ob)?2:0)]
+        );
+        tm = localtime((time_t *)&ob->load_time);
+        strftime(timest, sizeof(timest), "%Y.%m.%d-%H:%M:%S", tm);
+        fprintf(f, " %s\n", timest);
+    }
+    fclose(f);
+
+    return MY_TRUE;
+} /* dumpstat() */
+
+/*-------------------------------------------------------------------------*/
+Bool
+dumpstat_dest(string_t *fname)
+
+/* this function dumps statistics about all destructed objects into the file
+ * $MUDLIB/<fname>. It is called by dump_driver_info().
+ * Return TRUE on success, FALSE if <fname> can't be written.
+ */
+
+{
+    FILE *f;
+    object_t *ob;
+    char *native;
+
+    fname = check_valid_path(fname, current_object, STR_OBJDUMP, MY_TRUE);
+    if (!fname)
+        return MY_FALSE;
+
+    native = convert_path_str_to_native_or_throw(fname);
+    f = fopen(native, "w");
+    if (!f)
+        return MY_FALSE;
+    FCOUNT_WRITE(native);
+
+    for (ob = newly_destructed_objs; ob; ob = ob->next_all)
+    {
+#ifdef DEBUG
+        if (!(ob->flags & O_DESTRUCTED)) /* TODO: Can't happen */
+            continue;
+#endif
+        fprintf(f, "%-20s ref %2"PRIdPINT" NEW\n"
+                 , get_txt(ob->name)
+                 , ob->ref
+        );
+    }
+
+    for (ob = destructed_objs; ob; ob = ob->next_all)
+    {
+#ifdef DEBUG
+        if (!(ob->flags & O_DESTRUCTED)) /* TODO: Can't happen */
+            continue;
+#endif
+        fprintf(f, "%-20s ref %2"PRIdPINT"\n"
+                 , get_txt(ob->name)
+                 , ob->ref
+        );
+    }
+    fclose(f);
+    return MY_TRUE;
+} /* dumpstat_dest() */
+
+/***************************************************************************/
+
